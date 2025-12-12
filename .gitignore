@@ -145,6 +145,7 @@ dist
 # Serverless directories
 
 .serverless/
+.idea/
 
 # FuseBox cache
 
@@ -175,3 +176,4 @@ dist
 .dev.vars
 wrangler.toml
 .wrangler/
+/src/transactions.csv

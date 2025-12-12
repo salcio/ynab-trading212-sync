@@ -26,11 +26,13 @@ export enum Trading212Action {
 	LendingInterest = 'Lending interest',
 	CurrencyConversion = 'Currency conversion',
 	NewCardCost = 'New card cost',
+	CardDebit = 'Card debit',
+	SpendingCashback = 'Spending cashback'
 }
 
-const optionalString = z.string().transform((val) => (val ? val : undefined));
-const optionalMoney = z.string().transform((val) => (val ? parseMoney(val) : undefined));
-const optionalFloat = z.string().transform((val) => (val ? parseFloat(val) : undefined));
+const optionalString = z.string().transform((val) => (val ? val : undefined)).optional();
+const optionalMoney = z.string().transform((val) => (val ? parseMoney(val) : undefined)).optional();
+const optionalFloat = z.string().transform((val) => (val ? parseFloat(val) : undefined)).optional();
 
 const Trading212TransactionSchema = z.object({
 	// Core transaction details
@@ -69,17 +71,22 @@ const Trading212TransactionSchema = z.object({
 	conversionToCurrency: optionalString,
 	conversionFee: optionalMoney,
 	conversionFeeCurrency: optionalString,
+
+	// Merchant details
+	merchantName: optionalString,
+	merchantCategory: optionalString,
 });
 
 type Trading212Transaction = z.infer<typeof Trading212TransactionSchema>;
 
-export async function syncAccount({ TRADING212_TOKEN, YNAB_TOKEN, ACCOUNT: account_id, BUDGET, ...env }: Env) {
+export async function syncAccount({ TRADING212_TOKEN, YNAB_TOKEN, ACCOUNT: account_id, INVEST_ACCOUNT:invest_account_id, BUDGET, ...env }: Env) {
 	const categories = {
 		stock: { category_id: env.STOCK_CATEGORY_ID || undefined },
 		dividend: { category_id: env.DIVIDEND_CATEGORY_ID || undefined },
 		conversionFee: { category_id: env.CONVERSION_FEE_CATEGORY_ID || undefined },
 	} as const;
 
+	console.log("Starting sync for categories : ",categories);
 	const ynabAPI = new ynab.API(YNAB_TOKEN);
 	const { rest: trading212API } = new APIClient(APIClient.URL_LIVE, TRADING212_TOKEN);
 
@@ -88,7 +95,7 @@ export async function syncAccount({ TRADING212_TOKEN, YNAB_TOKEN, ACCOUNT: accou
 
 	async function getTrading212Transactions(ref?: { filePath: string } | { reportId: number }) {
 		let csvText: string;
-
+		console.log("Getting trading212 transactions for account :",account_id);
 		if (ref && 'filePath' in ref) {
 			csvText = fs.readFileSync(ref.filePath, 'utf8');
 		} else {
@@ -99,7 +106,7 @@ export async function syncAccount({ TRADING212_TOKEN, YNAB_TOKEN, ACCOUNT: accou
 					includeOrders: true,
 					includeTransactions: true,
 				},
-				timeFrom: day.subtract(1, 'year').toISOString(),
+				timeFrom: day.subtract(1, 'month').toISOString(),
 				timeTo: day.toISOString(),
 			});
 
@@ -116,35 +123,48 @@ export async function syncAccount({ TRADING212_TOKEN, YNAB_TOKEN, ACCOUNT: accou
 			csvText = await fetch(downloadLink).then((res) => res.text());
 		}
 
+		console.log('Got transactions csv. Parsing...');
 		const trading212Transactions: Trading212Transaction[] = parse(csvText, {
 			columns: true,
 			skip_empty_lines: true,
 			trim: true,
 		});
 
-		return trading212Transactions.map(parseTransaction);
+		try {
+			console.log('Parsing transactions...');
+			return trading212Transactions.map(parseTransaction);
+		}
+		finally {
+			console.log('Done parsing transactions.');
+		}
 	}
 
-	const trading212Transactions = await getTrading212Transactions();
+	const trading212Transactions = await getTrading212Transactions(env.TRANASCTIONS_FILE?{filePath:env.TRANASCTIONS_FILE }:undefined);
 
 	const [accountCurrency, instruments, t212Positions, payees, existingTransactions] = await Promise.all([
 		trading212API.account.getInfo().then((info) => info.currencyCode),
-		trading212API.metadata.getInstruments(),
-		trading212API.portfolio.getOpenPosition().then(
-			(positions) =>
-				new Map(
-					positions.map((position) => [
-						position.ticker,
-						{
-							quantity: parseT212StockQuantity(position.quantity),
-							ppl: parseMoney(position.ppl),
-						},
-					])
-				)
-		),
+		// TODO: Deal with instruments and positions - api was failing on those while parsing the response, probably the api library is out of date.
+		Promise.resolve(undefined),// trading212API.metadata.getInstruments(),
+				Promise.resolve(undefined),// trading212API.portfolio.getOpenPosition().then(
+		// 	(positions) =>
+		// 		new Map(
+		// 			positions.map((position) => [
+		// 				position.ticker,
+		// 				{
+		// 					quantity: parseT212StockQuantity(position.quantity),
+		// 					ppl: parseMoney(position.ppl),
+		// 				},
+		// 			])
+		// 		)
+		// ),
 		ynabAPI.payees.getPayees(BUDGET).then(({ data }) => data.payees),
 		ynabAPI.transactions.getTransactionsByAccount(BUDGET, account_id).then(({ data }) => data.transactions),
 	]);
+
+	const investAccountTransferPayee = payees.filter(e=>e.transfer_account_id===invest_account_id)[0];
+	if (!investAccountTransferPayee){
+		throw new Error(`No transfer payee found for invest account account ${invest_account_id}`);
+	}
 
 	const otherVersion = existingTransactions.find(
 		({ import_id }) => import_id?.startsWith(IMPORT_PREFIX) && !import_id.startsWith(VERSIONED_IMPORT_PREFIX)
@@ -190,6 +210,7 @@ export async function syncAccount({ TRADING212_TOKEN, YNAB_TOKEN, ACCOUNT: accou
 				break;
 			}
 
+			case Trading212Action.SpendingCashback:
 			case Trading212Action.InterestOnCash:
 			case Trading212Action.LendingInterest: {
 				transactionsToAdd.push({
@@ -198,9 +219,9 @@ export async function syncAccount({ TRADING212_TOKEN, YNAB_TOKEN, ACCOUNT: accou
 					cleared,
 					amount: t212Transaction.total,
 					payee_name: 'Interest',
-					memo: t212Transaction.action === Trading212Action.LendingInterest ? 'Lending interest' : null,
+					memo: t212Transaction.action === Trading212Action.LendingInterest ? 'Lending interest': t212Transaction.action === Trading212Action.SpendingCashback ? 'CashBack' : null,
 					flag_color: 'purple',
-					approved: t212Transaction.action === Trading212Action.InterestOnCash,
+					approved: t212Transaction.action !== Trading212Action.LendingInterest,
 					import_id,
 				});
 				break;
@@ -214,8 +235,8 @@ export async function syncAccount({ TRADING212_TOKEN, YNAB_TOKEN, ACCOUNT: accou
 				const stockAmount = amount + conversionFee;
 
 				const payee_name = `Stock: ${t212Transaction.name}`;
-				const payee_id = payees.find((p) => p.name === payee_name)?.id;
-				const memo = `${t212Transaction.shareCount}x ${t212Transaction.ticker} [${t212Transaction.isin}]`;
+				const payee_id = investAccountTransferPayee.id;// payees.find((p) => p.name === payee_name)?.id;
+				const memo = `${payee_name}: ${t212Transaction.shareCount}x ${t212Transaction.ticker} [${t212Transaction.isin}]`;
 
 				const transaction: ynab.NewTransaction = {
 					...categories.stock,
@@ -315,101 +336,115 @@ export async function syncAccount({ TRADING212_TOKEN, YNAB_TOKEN, ACCOUNT: accou
 				});
 				break;
 			}
-		}
-	}
 
-	const ynabPositions = new Map<string, { quantity: number; totalAmount: number; unclearedId?: string }>();
-
-	for (const transaction of [...existingTransactions, ...transactionsToAdd]) {
-		if (
-			!transaction.payee_name?.startsWith('Stock:') ||
-			!transaction.import_id?.startsWith(VERSIONED_IMPORT_PREFIX) ||
-			transaction.memo?.startsWith('Dividend ')
-		) {
-			continue;
-		}
-
-		const match = transaction.memo?.match(/^([\d.]+)x.+\[(.*?)\]$/);
-
-		if (!match) {
-			throw new Error(`Could not parse memo: ${transaction.memo}`);
-		}
-
-		const quantity = parseT212StockQuantity(match[1]);
-		const isin = match[2];
-
-		const position = ynabPositions.get(isin) || { quantity: 0, totalAmount: 0 };
-
-		if (transaction.cleared === 'cleared') {
-			let transactionAmount = transaction.amount!;
-			if (transaction.subtransactions?.length) {
-				const stockTransaction = transaction.subtransactions.find((sub) => sub.memo?.includes('x'));
-				if (stockTransaction) {
-					transactionAmount = stockTransaction.amount;
-				}
+			case Trading212Action.CardDebit: {
+				transactionsToAdd.push({
+					account_id,
+					date,
+					cleared,
+					amount: t212Transaction.total,
+					payee_name: t212Transaction.merchantName,
+					memo: t212Transaction.merchantCategory,
+					import_id,
+				});
+				break;
 			}
-
-			if (transactionAmount > 0) {
-				const proportionSold = quantity / position.quantity;
-				position.quantity -= quantity;
-				position.totalAmount = Math.round(position.totalAmount * (1 - proportionSold));
-			} else {
-				position.quantity += quantity;
-				position.totalAmount += Math.abs(transactionAmount);
-			}
-		} else if (transaction.cleared === 'uncleared' && 'id' in transaction && typeof transaction.id === 'string') {
-			position.unclearedId = transaction.id;
-		}
-
-		ynabPositions.set(isin, position);
-	}
-
-	for (const [isin, ynabPosition] of ynabPositions) {
-		if (ynabPosition.quantity <= 0) {
-			continue;
-		}
-
-		const instrument = instruments.find((i) => i.isin === isin && t212Positions.has(i.ticker));
-		if (!instrument) {
-			continue;
-		}
-
-		const t212Position = t212Positions.get(instrument.ticker);
-
-		if (!t212Position) {
-			throw new Error(`No t212 position for ${instrument.ticker} [${isin}]`);
-		}
-
-		const ynabPpl = Math.round((ynabPosition.quantity / t212Position.quantity) * t212Position.ppl);
-		const currentValue = ynabPosition.totalAmount + ynabPpl;
-		const payee_name = `Stock: ${instrument.name}`;
-		const payee_id = payees.find((p) => p.name === payee_name)?.id;
-
-		const transaction: ynab.SaveTransactionWithIdOrImportId = {
-			...categories.stock,
-			account_id,
-			date: today,
-			cleared: 'uncleared',
-			amount: currentValue,
-			payee_name,
-			payee_id,
-			memo: `${ynabPosition.quantity / 1e10}x ${instrument.shortName} [${isin}]`,
-			approved: true,
-		};
-
-		if (ynabPosition.unclearedId) {
-			transaction.id = ynabPosition.unclearedId;
-			transactionsToUpdate.push(transaction);
-		} else {
-			transaction.import_id = createImportId(`${isin}:${today}:${currentValue}`);
-			transactionsToAdd.push(transaction);
 		}
 	}
+	// TODO: Deal with instruments and positions
+	// const ynabPositions = new Map<string, { quantity: number; totalAmount: number; unclearedId?: string }>();
+	//
+	// for (const transaction of [...existingTransactions, ...transactionsToAdd]) {
+	// 	if (
+	// 		!transaction.payee_name?.startsWith('Stock:') ||
+	// 		!transaction.import_id?.startsWith(VERSIONED_IMPORT_PREFIX) ||
+	// 		transaction.memo?.startsWith('Dividend ')
+	// 	) {
+	// 		continue;
+	// 	}
+	//
+	// 	const match = transaction.memo?.match(/^([\d.]+)x.+\[(.*?)\]$/);
+	//
+	// 	if (!match) {
+	// 		throw new Error(`Could not parse memo: ${transaction.memo}`);
+	// 	}
+	//
+	// 	const quantity = parseT212StockQuantity(match[1]);
+	// 	const isin = match[2];
+	//
+	// 	const position = ynabPositions.get(isin) || { quantity: 0, totalAmount: 0 };
+	//
+	// 	if (transaction.cleared === 'cleared') {
+	// 		let transactionAmount = transaction.amount!;
+	// 		if (transaction.subtransactions?.length) {
+	// 			const stockTransaction = transaction.subtransactions.find((sub) => sub.memo?.includes('x'));
+	// 			if (stockTransaction) {
+	// 				transactionAmount = stockTransaction.amount;
+	// 			}
+	// 		}
+	//
+	// 		if (transactionAmount > 0) {
+	// 			const proportionSold = quantity / position.quantity;
+	// 			position.quantity -= quantity;
+	// 			position.totalAmount = Math.round(position.totalAmount * (1 - proportionSold));
+	// 		} else {
+	// 			position.quantity += quantity;
+	// 			position.totalAmount += Math.abs(transactionAmount);
+	// 		}
+	// 	} else if (transaction.cleared === 'uncleared' && 'id' in transaction && typeof transaction.id === 'string') {
+	// 		position.unclearedId = transaction.id;
+	// 	}
+	//
+	// 	ynabPositions.set(isin, position);
+	// }
+	//
+	// for (const [isin, ynabPosition] of ynabPositions) {
+	// 	if (ynabPosition.quantity <= 0) {
+	// 		continue;
+	// 	}
+	//
+	// 	const instrument = instruments.find((i) => i.isin === isin && t212Positions.has(i.ticker));
+	// 	if (!instrument) {
+	// 		continue;
+	// 	}
+	//
+	// 	const t212Position = t212Positions.get(instrument.ticker);
+	//
+	// 	if (!t212Position) {
+	// 		throw new Error(`No t212 position for ${instrument.ticker} [${isin}]`);
+	// 	}
+	//
+	// 	const ynabPpl = Math.round((ynabPosition.quantity / t212Position.quantity) * t212Position.ppl);
+	// 	const currentValue = ynabPosition.totalAmount + ynabPpl;
+	// 	const payee_name = `Stock: ${instrument.name}`;
+	// 	const payee_id = payees.find((p) => p.name === payee_name)?.id;
+	//
+	// 	console.log('Instrument name: {shorName}, {shortname}', (instrument as any).shortName, instrument.shortname)
+	// 	const transaction: ynab.SaveTransactionWithIdOrImportId = {
+	// 		...categories.stock,
+	// 		account_id,
+	// 		date: today,
+	// 		cleared: 'uncleared',
+	// 		amount: currentValue,
+	// 		payee_name,
+	// 		payee_id,
+	// 		memo: `${ynabPosition.quantity / 1e10}x ${instrument.shortname} [${isin}]`,
+	// 		approved: true,
+	// 	};
+	//
+	// 	if (ynabPosition.unclearedId) {
+	// 		transaction.id = ynabPosition.unclearedId;
+	// 		transactionsToUpdate.push(transaction);
+	// 	} else {
+	// 		transaction.import_id = createImportId(`${isin}:${today}:${currentValue}`);
+	// 		transactionsToAdd.push(transaction);
+	// 	}
+	// }
 
 	if (transactionsToAdd.length) {
-		await ynabAPI.transactions.createTransactions(BUDGET, {
+		console.log('Add Transactions response: ',await ynabAPI.transactions.createTransactions(BUDGET, {
 			transactions: transactionsToAdd,
-		});
+		}));
 	}
 
 	if (transactionsToUpdate.length) {
@@ -464,5 +499,7 @@ function parseTransaction(data: any): Trading212Transaction {
 		conversionToCurrency: data['Currency (Currency conversion to amount)'],
 		conversionFee: data['Currency conversion fee'],
 		conversionFeeCurrency: data['Currency (Currency conversion fee)'],
+		merchantName: data['Merchant name'],
+		merchantCategory: data['Merchant category'],
 	});
 }
