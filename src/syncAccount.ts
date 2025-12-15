@@ -27,7 +27,8 @@ export enum Trading212Action {
 	CurrencyConversion = 'Currency conversion',
 	NewCardCost = 'New card cost',
 	CardDebit = 'Card debit',
-	SpendingCashback = 'Spending cashback'
+	SpendingCashback = 'Spending cashback',
+	CardCredit = 'Card credit'
 }
 
 const optionalString = z.string().transform((val) => (val ? val : undefined)).optional();
@@ -337,6 +338,7 @@ export async function syncAccount({ TRADING212_TOKEN, YNAB_TOKEN, ACCOUNT: accou
 				break;
 			}
 
+			case Trading212Action.CardCredit:
 			case Trading212Action.CardDebit: {
 				transactionsToAdd.push({
 					account_id,
